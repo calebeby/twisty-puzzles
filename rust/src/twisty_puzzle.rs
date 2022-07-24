@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
+use std::f64::consts::TAU;
 
 use crate::bijection::Bijection;
 use crate::point_in_space_map::PointInSpaceMap;
@@ -67,6 +70,11 @@ pub struct TwistyPuzzle {
     pub turn_names: Vec<String>,
     // Each piece is a vector of its face indexes
     pieces: Vec<Vec<usize>>,
+}
+
+pub struct Symmetry {
+    face_map: Bijection,
+    turn_map: Bijection,
 }
 
 impl TwistyPuzzle {
@@ -215,7 +223,7 @@ impl TwistyPuzzle {
             original_face_centers_map.insert(*face, i);
         }
 
-        // try out each of the turns to determine the symmetries between pieces
+        // try out each of the turns to determine the correspondence between pieces
         // and which faces map to which faces after each turn
         let (turn_names, turns): (Vec<_>, Vec<_>) = physical_turns
             .into_iter()
@@ -236,7 +244,7 @@ impl TwistyPuzzle {
                                 );
                                 // Find the index in the old faces array
                                 // which corresponds to the new position
-                                *original_face_centers_map.get(&new_location).unwrap_or(&i)
+                                *original_face_centers_map.get(&new_location).unwrap()
                             } else {
                                 // this turn does not affect this face; map to itself
                                 i
@@ -252,6 +260,137 @@ impl TwistyPuzzle {
                 (turn_name, turn)
             })
             .unzip();
+
+        let top_face = &polyhedron.faces[0];
+
+        let face_rotation_angle = Vector3D::angle_between(
+            &(&top_face.vertices[0] - &top_face.plane().point),
+            &(&top_face.vertices[1] - &top_face.plane().point),
+        );
+        println!("{:#?} {:#?}", &top_face.vertices[0], &top_face.vertices[1]);
+        println!("face rotation angle {}", face_rotation_angle);
+
+        #[cfg(test)]
+        assert!((TAU / face_rotation_angle) % 1.0 < std::f64::EPSILON);
+
+        let num_top_rotations = (TAU / face_rotation_angle).round() as usize;
+        println!("num top rotations {}", num_top_rotations);
+        let top_rotation = Rotation3D::new(&top_face.plane().point, face_rotation_angle);
+
+        // Face map which rotates the whole puzzle in a symmetric increment around the top face
+        let top_rotation_face_map = Bijection(
+            faces
+                .iter()
+                .enumerate()
+                .map(|(i, _face)| {
+                    let original_location = &face_centers[i];
+                    let new_location = top_rotation.rotate_point_about_origin(original_location);
+                    // Find the index in the old faces array
+                    // which corresponds to the new position
+                    *original_face_centers_map.get(&new_location).unwrap()
+                })
+                .collect(),
+        );
+
+        println!("top face center {:#?}", top_face.plane().point);
+        println!("top face vertices {:#?}", top_face.vertices);
+
+        // map from the face map to the turn index
+        let turns_by_face_map: HashMap<Bijection, usize> = turns
+            .iter()
+            .enumerate()
+            .map(|(turn_index, turn)| (turn.face_map, turn_index))
+            .collect();
+
+        let symmetry_face_maps = polyhedron.faces.iter().flat_map(|new_top_face| {
+            // Move the new_top_face to the top,
+            // and then rotate it to align it with the original top face position
+            let rotation_to_top_angle =
+                Vector3D::angle_between(&new_top_face.plane().point, &top_face.plane().point);
+            let rotation_to_top_axis =
+                if (rotation_to_top_angle - std::f64::consts::PI).abs() > std::f64::EPSILON {
+                    new_top_face.plane().point.cross(&top_face.plane().point)
+                } else {
+                    // Rotation of 180deg (original bottom face becomes top)
+                    // the cross product won't yield a useful result
+                    // (because of floating point error)
+                    // so we come up with a different axis for rotation
+                    Vector3D::new(0.0, 1.0, 0.0).cross(&top_face.plane().point)
+                };
+            let rotation_to_top = Rotation3D::new(&rotation_to_top_axis, rotation_to_top_angle);
+            // Apply the rotation to one vertex of new_top_face and then align the vertex with
+            // one of the original vertex positions of the old top face
+            let new_vertex_position_unaligned =
+                rotation_to_top.rotate_point_about_origin(&new_top_face.vertices[0]);
+            let top_alignment_rotation_axis = &top_face.plane().point;
+            let top_alignment_rotation_angle = Vector3D::angle_between(
+                &(&new_vertex_position_unaligned - &top_face.plane().point),
+                &(&top_face.vertices[0] - &top_face.plane().point),
+            );
+            let top_alignment_rotation =
+                Rotation3D::new(top_alignment_rotation_axis, top_alignment_rotation_angle);
+            let combined_rotation =
+                Rotation3D::combine_rotations(&rotation_to_top, &top_alignment_rotation);
+
+            #[cfg(test)]
+            assert!(combined_rotation
+                .rotate_point_about_origin(&new_top_face.plane().point)
+                .approx_equals(&top_face.plane().point));
+
+            // Face map that moves the selected face to the top face
+            let face_map_to_top = Bijection(
+                faces
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _face)| {
+                        let original_location = &face_centers[i];
+                        let new_location =
+                            combined_rotation.rotate_point_about_origin(original_location);
+                        // Find the index in the old faces array
+                        // which corresponds to the new position
+                        *original_face_centers_map.get(&new_location).unwrap()
+                    })
+                    .collect(),
+            )
+            .invert();
+
+            (1..num_top_rotations).fold(vec![face_map_to_top], |mut prev_maps, _| {
+                prev_maps.push(prev_maps.last().unwrap().apply(&top_rotation_face_map));
+                prev_maps
+            })
+        });
+        // yes, this is wrong (it generates only duplicates)
+        // But, we _can_ make mirrored versions of everything
+        // (we need to find an axis to mirror through)
+        // .flat_map(|face_map| [face_map.invert(), face_map])
+
+        let symmetries: Vec<Symmetry> = symmetry_face_maps
+            .filter_map(|symmetry| {
+                let turn_map = Bijection(
+                    turns
+                        .iter()
+                        .filter_map(|turn| {
+                            let original_face_map = &turn.face_map;
+                            let symmetry_face_map = symmetry.apply(&original_face_map);
+                            let turn_index = turns_by_face_map.get(&symmetry_face_map);
+                            Some(*turn_index?)
+                        })
+                        .collect(),
+                );
+                Some(Symmetry {
+                    face_map: symmetry,
+                    turn_map,
+                })
+            })
+            .collect();
+
+        #[cfg(test)]
+        {
+            let deduped: HashSet<Bijection> = HashSet::from_iter(symmetry_face_maps.clone());
+            assert_eq!(deduped.len(), symmetry_face_maps.count())
+        }
+
+        println!("Non-unique symmetries: {:?}", symmetries.len());
 
         Self {
             faces,
